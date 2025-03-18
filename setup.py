@@ -28,32 +28,38 @@ def reqs(file, without=None):
         ]
 
 
-compat_reqs = ['dataclasses==0.7;python_version<"3.7"']
-
-utils_reqs = reqs("utils-requirements.txt")
-test_reqs = reqs("test-requirements.txt")
+doc_reqs = reqs("requirements/docs.txt")
+base_reqs = reqs("requirements/base.txt")
+utils_reqs = reqs("requirements/utils.txt")
+test_reqs = reqs("requirements/test.txt")
+torch_reqs = reqs("requirements/torch.txt")
+all_reqs = [base_reqs, utils_reqs, torch_reqs]
 
 setup(
     name="gretel-synthetics",
     author="Gretel Labs, Inc.",
-    author_email="open-source@gretel.ai",
+    author_email="support@gretel.ai",
     use_scm_version=True,
-    setup_requires=["setuptools_scm"],
+    setup_requires=["setuptools_scm==8.1.0"],
     description="Synthetic Data Generation with optional Differential Privacy",
     url="https://github.com/gretelai/gretel-synthetics",
-    license="http://www.apache.org/licenses/LICENSE-2.0",
+    license="https://gretel.ai/license/source-available-license",
     long_description=long_description,
     long_description_content_type="text/markdown",
     package_dir={"": "src"},
     packages=find_packages("src"),
-    python_requires=">=3.6",
-    install_requires=(
-        reqs("requirements.txt", without=["tensorflow==", "torch=="]) + compat_reqs
-    ),
-    extras_require={"all": utils_reqs, "utils": utils_reqs, "test": test_reqs},
+    python_requires=">=3.9",
+    install_requires=base_reqs,
+    extras_require={
+        "all": [req for reqs in all_reqs for req in reqs],
+        "utils": utils_reqs,
+        "test": test_reqs,
+        "torch": torch_reqs,
+        "docs": doc_reqs,
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: Apache Software License",
+        "License :: Free To Use But Restricted",
         "Operating System :: POSIX :: Linux",
         "Operating System :: MacOS",
         "Operating System :: Microsoft :: Windows",

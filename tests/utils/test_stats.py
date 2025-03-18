@@ -36,6 +36,33 @@ def test_count_memorized_lines(fake: faker.Faker):
     )
 
 
+def test_memorized_lines_differing_dtypes():
+    data_source = "https://gretel-public-website.s3.us-west-2.amazonaws.com/datasets/USAdultIncome5k.csv"
+    left = pd.read_csv(data_source)
+    right = pd.read_csv(data_source)
+
+    right.loc[0, "capital_gain"] = np.nan
+    right.loc[len(right)] = left.loc[0].values.tolist()
+
+    # Here, we cast within two numeric types and can find duplicates.  We drop duplicates _within_ each df to prevent overcounting.
+    assert stats.count_memorized_lines(left, right) == 4998
+
+    # If one field is already dumped directly from int to string before we can look at things, we still attempt uptying to find duplicates.
+    left_stringified = left.astype({"capital_gain": str})
+    assert stats.count_memorized_lines(left_stringified, right) == 4998
+
+    # BUT if we change one entry to a "real" string, the uptyping conversion will fail and we will skip this column.
+    # We proceed to floatify numeric columns (including "capital_gain" in the right df), then dump to string.
+    # The int format strings in left and float formatted strings will not match and we get 0 memorized lines.
+    left_stringified["capital_gain"][0] = "hello"
+    assert stats.count_memorized_lines(left_stringified, right) == 0
+
+    # BUT if the float field is stringified first, the int column will eventually match as we step down to object via float.
+    left_floated = left.astype({"capital_gain": "float"})
+    right_stringified = right.astype({"capital_gain": "object"})
+    assert stats.count_memorized_lines(left_floated, right_stringified) == 4998
+
+
 def test_get_categorical_field_distribution():
     df = pd.DataFrame(
         [{"foo": "bar"}] * 2 + [{"foo": "baz"}] * 2 + [{"foo": "barf"}] * 4
@@ -103,3 +130,50 @@ def test_numeric_binning_sanity():
             assert len(bins) < 500
 
     assert found_bad_column
+
+
+def test_correlations_with_inf():
+    df1 = pd.DataFrame(
+        [{"foo": 1, "bar": 1}, {"foo": 2, "bar": 2}, {"foo": 3, "bar": 3}] * 10
+    )
+    df1_corr = stats.calculate_correlation(df1)
+    assert not df1_corr.empty
+    df1_corr_opt = stats.calculate_correlation(df1, opt=True)
+    assert not df1_corr_opt.empty
+
+    df2 = pd.DataFrame(
+        [{"foo": 1.1, "bar": 1}, {"foo": 2.2, "bar": 2}, {"foo": np.inf, "bar": 3}] * 10
+    )
+    df2_corr = stats.calculate_correlation(df2)
+    assert not df2_corr.empty
+    df2_corr_opt = stats.calculate_correlation(df2, opt=True)
+    assert not df2_corr_opt.empty
+
+    df_multi_dtype_list = []
+    for i in range(100):
+        entry = {"foo": i, "foobie": i, "bar": i * 1.1, "baz": str(i) + "yoooo"}
+        if i % 3 == 0:
+            entry["foo"] = np.inf
+        if i % 11 == 0:
+            entry["foo"] = np.nan
+
+        if i % 5 == 0:
+            entry["bar"] = np.inf
+        if i % 13 == 0:
+            entry["bar"] = np.nan
+
+        if i % 7 == 0:
+            entry["baz"] = np.inf
+        if i % 17 == 0:
+            entry["baz"] = np.nan
+
+        df_multi_dtype_list.append(entry)
+    df_multi_type = pd.DataFrame(df_multi_dtype_list)
+    df_multi_type_corr = stats.calculate_correlation(
+        df_multi_type, nominal_columns=["baz"]
+    )
+    assert not df_multi_type_corr.empty
+    df_multi_type_corr_opt = stats.calculate_correlation(
+        df_multi_type, nominal_columns=["baz"], opt=True
+    )
+    assert not df_multi_type_corr_opt.empty

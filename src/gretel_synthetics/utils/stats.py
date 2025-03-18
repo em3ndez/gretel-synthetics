@@ -1,7 +1,10 @@
 """
 Generates correlation reports between data sets.
 """
+
 import math
+import uuid
+import warnings
 
 from typing import List, Tuple
 
@@ -11,6 +14,7 @@ import pandas as pd
 
 from dython.nominal import correlation_ratio, theils_u
 from joblib import delayed, Parallel
+from pandas.api.types import is_numeric_dtype
 from scipy.spatial.distance import jensenshannon
 from scipy.stats import pearsonr
 from sklearn.decomposition import PCA as PCA_ANAL
@@ -19,6 +23,9 @@ from sklearn.preprocessing import StandardScaler
 _DEFAULT_JOB_COUNT = 4
 _DEFAULT_REPLACE_VALUE = 0.0
 UNIQUENESS_THRESHOLD = 0.1
+
+# Rounding warnings can be extremely noisy.
+warnings.filterwarnings("ignore", module="dython.nominal")
 
 
 def count_memorized_lines(df1: pd.DataFrame, df2: pd.DataFrame) -> int:
@@ -32,9 +39,49 @@ def count_memorized_lines(df1: pd.DataFrame, df2: pd.DataFrame) -> int:
     Returns:
         int, the number of overlapping elements.
     """
-    set1 = set(df1.to_csv(header=False, index=False).strip("\n").split("\n"))
-    set2 = set(df2.to_csv(header=False, index=False).strip("\n").split("\n"))
-    return len(set1.intersection(set2))
+
+    # Look for cases where col is numeric in one df, object in the other. Attempt to cast to float.
+    def _uptype_object_to_float(
+        l: pd.DataFrame, r: pd.DataFrame
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        for col in set(l.columns).intersection(set(r.columns)):
+            if is_numeric_dtype(l[col]) or is_numeric_dtype(r[col]):
+                if not is_numeric_dtype(l[col]) or not is_numeric_dtype(r[col]):
+                    try:
+                        l = l.astype({col: "float"})
+                        r = r.astype({col: "float"})
+                    except Exception:
+                        # In particular ValueErrors if the non-numeric is not convertible, but catch everything.
+                        pass
+        return l, r
+
+    # Convert any numeric fields within a df to 'float' first.
+    def _floatify(df: pd.DataFrame) -> pd.DataFrame:
+        conversions = {}
+        for col in df.columns:
+            if is_numeric_dtype(df[col]):
+                conversions[col] = "float"
+        return df.astype(conversions)
+
+    # If one col in a df is numeric and the corresponding one in the other df is NOT, cast to 'object'.
+    def _objectify(
+        l: pd.DataFrame, r: pd.DataFrame
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        conversions = {}
+        for col in l.columns:
+            if col in r:
+                if not is_numeric_dtype(l[col]) or not is_numeric_dtype(r[col]):
+                    conversions[col] = "object"
+        return (l.astype(conversions), r.astype(conversions))
+
+    # Do the casts.
+    l, r = _uptype_object_to_float(df1, df2)
+    l, r = _objectify(_floatify(l), _floatify(r))
+
+    # Do an inner join on the intersection of columns present in both dfs.
+    inner_join = pd.merge(l.drop_duplicates(), r.drop_duplicates())
+
+    return len(inner_join)
 
 
 def get_categorical_field_distribution(field: pd.Series) -> dict:
@@ -70,8 +117,9 @@ def get_numeric_distribution_bins(training: pd.Series, synthetic: pd.Series):
         bin_edges, numpy array of dtype float
 
     """
-    training = training.dropna().astype("float64")
-    synthetic = synthetic.dropna().astype("float64")
+    with pd.option_context("mode.use_inf_as_na", True):
+        training = training.dropna().astype("float64")
+        synthetic = synthetic.dropna().astype("float64")
     # Numeric data. Want the same bins between both df's. We bin based on scrubbed data.
     if len(training) == 0:
         min_value = np.nanmin(synthetic)
@@ -82,25 +130,21 @@ def get_numeric_distribution_bins(training: pd.Series, synthetic: pd.Series):
     else:
         min_value = min(np.nanmin(training), np.nanmin(synthetic))
         max_value = max(np.nanmax(training), np.nanmax(synthetic))
-    bins = np.array([], dtype=np.float)
+    bins = np.array([], dtype=np.float64)
+
+    # Use 'doane' to find bins. 'fd' causes too many OOM issues.
+    # We also bin across the training and synthetic Series combined since we are binning across the combined range, otherwise we can see OOM's or sigkill's.
     try:
-        # Use ‘fd’ (Freedman Diaconis Estimator) if we can.  This can produce MANY bins or MemoryErrors,
-        # in that case use 'doane' instead (improved Sturges).
-        bins = np.histogram_bin_edges(training, bins="fd", range=(min_value, max_value))
+        bins = np.histogram_bin_edges(
+            pd.concat([training, synthetic]), bins="doane", range=(min_value, max_value)
+        )
     except Exception:
         pass
-    if len(bins) == 0 or len(bins) > 500:
-        try:
-            bins = np.histogram_bin_edges(
-                training, bins="doane", range=(min_value, max_value)
-            )
-        except Exception:
-            pass
     # If 'doane' still doesn't do the trick just force 500 bins.
     if len(bins) == 0 or len(bins) > 500:
         try:
             bins = np.histogram_bin_edges(
-                training, bins=500, range=(min_value, max_value)
+                pd.concat([training, synthetic]), bins=500, range=(min_value, max_value)
             )
         except Exception:
             pass
@@ -174,7 +218,8 @@ def calculate_pearsons_r(x, y, opt) -> Tuple[float, float]:
     if not opt:
         # drop missing values, when either the x or y value is null/nan
         arr = np.array([x, y]).transpose()
-        arr = arr[~pd.isnull(arr).any(axis=1)].transpose()
+        with pd.option_context("mode.use_inf_as_na", True):
+            arr = arr[~pd.isnull(arr).any(axis=1)].transpose()
         if (
             len(arr[0]) < 2
             or len(arr[1]) < 2
@@ -205,7 +250,8 @@ def calculate_correlation_ratio(x, y, opt):
     if not opt:
         # Drop missing values if y (the numeric column) is null/nan
         df = pd.DataFrame({"x": x, "y": y})
-        df.dropna(inplace=True)
+        with pd.option_context("mode.use_inf_as_na", True):
+            df.dropna(inplace=True)
         x = df["x"]
         y = df["y"]
     if len(x) < 2 or len(y) < 2:
@@ -231,7 +277,8 @@ def calculate_theils_u(x, y):
     """
     # Drop missing values if x or y is null/nan
     df = pd.DataFrame({"x": x, "y": y})
-    df.dropna(inplace=True)
+    with pd.option_context("mode.use_inf_as_na", True):
+        df.dropna(inplace=True)
     x = df["x"]
     y = df["y"]
     if len(x) == 0 or len(y) == 0:
@@ -261,35 +308,53 @@ def calculate_correlation(
         A dataframe of correlation values.
 
     """
-
+    # PLAT-1131 Ensure that all nominal columns are present in df.
+    if nominal_columns is not None:
+        _df_cols = df.columns
+        nominal_columns = [col for col in nominal_columns if col in _df_cols]
     # If opt is True, then go the faster (just not quite as accurate) route of global replace missing with 0
     if opt:
-        df.fillna(_DEFAULT_REPLACE_VALUE, inplace=True)
+        with pd.option_context("mode.use_inf_as_na", True):
+            df.fillna(_DEFAULT_REPLACE_VALUE, inplace=True)
 
     columns = df.columns
     if nominal_columns is None:
         nominal_columns = list()
 
-    corr = pd.DataFrame(index=columns, columns=columns)
+    df_cp = df.copy()
+    # Replace NaNs with NaN proxy only for nominal columns. This helps with more consistency in FCS regardless of the generated row counts.
+    df_cp[nominal_columns] = df_cp[nominal_columns].fillna(f"gretel-{uuid.uuid4().hex}")
+
+    corr = np.zeros((len(columns), len(columns)))
     single_value_columns = []
     numeric_columns = []
 
+    column_to_index = {}
+
     # Set up all the column groupings needed for correlation
-    for c in columns:
-        if df[c].nunique() == 1:
+    for i, c in enumerate(columns):
+        if df_cp[c].nunique() == 1:
             single_value_columns.append(c)
         elif c not in nominal_columns:
-            numeric_columns.append(c)
+            if df_cp[c].dtype == "object":
+                nominal_columns.append(c)
+            else:
+                numeric_columns.append(c)
 
+        column_to_index[c] = i
+
+    # Replace NaNs with NaN proxy one more time since the nominal column might have updated.
+    df_cp[nominal_columns] = df_cp[nominal_columns].fillna(f"gretel-{uuid.uuid4().hex}")
     nominal = [x for x in nominal_columns if x not in single_value_columns]
-    df_rows = df.shape[0]
+    df_rows = df_cp.shape[0]
     high_unique_nominal = []
     completely_unique_nominal = []
     not_high_unique_nominal = []
+    uniqueness_ratios = df_cp.nunique() / df_rows
     for c in nominal:
-        if df[c].nunique() / df_rows == 1:
+        if uniqueness_ratios[c] == 1:
             completely_unique_nominal.append(c)
-        elif df[c].nunique() / df_rows > UNIQUENESS_THRESHOLD:
+        elif uniqueness_ratios[c] > UNIQUENESS_THRESHOLD:
             high_unique_nominal.append(c)
         else:
             not_high_unique_nominal.append(c)
@@ -300,48 +365,58 @@ def calculate_correlation(
 
     # Do Theil's U shortcut for 100% unique nominal (Amy invention that is 99.9% correct, and saves massive time)
     for x in completely_unique_nominal:
-        corr.loc[x, :] = 1.0
+        x_index = column_to_index[x]
+
+        corr[x_index, :] = 1.0
         for y in columns:
+            y_index = column_to_index[y]
             if x == y:
-                corr.at[y, x] = 1.0
+                corr[y_index][x_index] = 1.0
             # Edge case, guard against ValueError in math.log when the other column is empty
-            elif df[y].nunique() == 0:
-                corr.at[y, x] = 0.0
+            elif df_cp[y].nunique() == 0:
+                corr[y_index][x_index] = 0.0
             else:
-                corr.at[y, x] = math.log(df[y].nunique()) / math.log(df[x].nunique())
+                corr[y_index][x_index] = math.log(df_cp[y].nunique()) / math.log(
+                    df_cp[x].nunique()
+                )
 
     for x in single_value_columns:
-        corr.loc[:, x] = 0.0
-        corr.loc[x, :] = 0.0
-        corr.loc[x, x] = 1.0
+        x_index = column_to_index[x]
+        corr[:, x_index] = 0.0
+        corr[x_index, :] = 0.0
+        corr[x_index, x_index] = 1.0
 
     # Do nominal-nominal exluding any that are 100% unique (Theil's U)
     scores = Parallel(n_jobs=job_count)(
-        delayed(calculate_theils_u)(df[field1], df[field2])
+        delayed(calculate_theils_u)(df_cp[field1], df_cp[field2])
         for field1 in notcompletely_unique_nominal
         for field2 in notcompletely_unique_nominal
     )
     i = 0
     for field1 in notcompletely_unique_nominal:
+        field1_index = column_to_index[field1]
         for field2 in notcompletely_unique_nominal:
+            field2_index = column_to_index[field2]
             if field1 == field2:
-                corr.at[field1, field2] = 1.0
+                corr[field1_index][field2_index] = 1.0
             else:
                 # looks backward, but is correct
-                corr.at[field2, field1] = scores[i]
+                corr[field2_index][field1_index] = scores[i]
             i += 1
 
     # Do "not_high_unique_nominal with numeric" (Correlation Ratio)
     scores = Parallel(n_jobs=job_count)(
-        delayed(calculate_correlation_ratio)(df[field1], df[field2], opt)
+        delayed(calculate_correlation_ratio)(df_cp[field1], df_cp[field2], opt)
         for field1 in not_high_unique_nominal
         for field2 in numeric_columns
     )
     i = 0
     for field1 in not_high_unique_nominal:
+        field1_index = column_to_index[field1]
         for field2 in numeric_columns:
-            corr.at[field1, field2] = scores[i]
-            corr.at[field2, field1] = scores[i]
+            field2_index = column_to_index[field2]
+            corr[field1_index][field2_index] = scores[i]
+            corr[field2_index][field1_index] = scores[i]
             i += 1
 
     # Do high_unique_nominal with numeric (Theil's U) (excluding 100% unique)
@@ -351,25 +426,16 @@ def calculate_correlation(
     # comparing the mean within buckets to the mean overall to give unstable, over inflated
     # correlation values.  Using Theil's U instead gives a much more realistic score
     scores = Parallel(n_jobs=job_count)(
-        delayed(calculate_theils_u)(df[field1], df[field2])
+        delayed(calculate_theils_u)(df_cp[field1], df_cp[field2])
         for field1 in high_unique_nominal
         for field2 in numeric_columns
     )
     i = 0
     for field1 in high_unique_nominal:
+        field1_index = column_to_index[field1]
         for field2 in numeric_columns:
-            corr.at[field2, field1] = scores[i]
-            i += 1
-
-    scores = Parallel(n_jobs=job_count)(
-        delayed(calculate_theils_u)(df[field1], df[field2])
-        for field2 in high_unique_nominal
-        for field1 in numeric_columns
-    )
-    i = 0
-    for field2 in high_unique_nominal:
-        for field1 in numeric_columns:
-            corr.at[field2, field1] = scores[i]
+            field2_index = column_to_index[field2]
+            corr[field2_index][field1_index] = scores[i]
             i += 1
 
     # Do numeric numeric (Pearson's)
@@ -380,32 +446,25 @@ def calculate_correlation(
             for j in range(i + 1, num_len):
                 delayed_calls.append(
                     delayed(calculate_pearsons_r)(
-                        df[numeric_columns[i]], df[numeric_columns[j]], opt
+                        df_cp[numeric_columns[i]], df_cp[numeric_columns[j]], opt
                     )
                 )
         scores = Parallel(n_jobs=1)(delayed_calls)
         x = 0
         for i in range(num_len - 1):
+            num_columns_index = column_to_index[numeric_columns[i]]
             for j in range(i + 1, num_len):
-                corr.at[numeric_columns[i], numeric_columns[j]] = scores[x][0]
-                corr.at[numeric_columns[j], numeric_columns[i]] = scores[x][0]
+                num_columns_jindex = column_to_index[numeric_columns[j]]
+                corr[num_columns_index][num_columns_jindex] = scores[x][0]
+                corr[num_columns_jindex][num_columns_index] = scores[x][0]
                 x += 1
 
     for x in numeric_columns:
-        corr.at[x, x] = 1.0
+        x_index = column_to_index[x]
+        corr[x_index][x_index] = 1.0
 
-    corr_final = pd.DataFrame(index=columns, columns=columns)
-
-    for field1 in columns:
-        for field2 in columns:
-            if (
-                not np.isnan(corr.at[field1, field2])
-                and abs(corr.at[field1, field2]) < np.inf
-            ):
-                corr_final[field1][field2] = corr[field1][field2]
-            else:
-                corr_final[field1][field2] = 0
-
+    corr_final = pd.DataFrame(corr, index=columns, columns=columns)
+    corr_final[corr_final == np.inf] = 0
     corr_final.fillna(value=np.nan, inplace=True)
 
     return corr_final
@@ -471,9 +530,23 @@ def compute_pca(df: pd.DataFrame, n_components: int = 2) -> pd.DataFrame:
 
     """
     seed = 444
-    df = df.dropna(axis="columns", how="all")
+    with pd.option_context("mode.use_inf_as_na", True):
+        df = df.dropna(axis="columns", how="all")
     df_norm = normalize_dataset(df)
     pca = PCA_ANAL(n_components=n_components, random_state=seed)
     projected = pca.fit_transform(df_norm)
     columns = [f"pc{i + 1}" for i in range(n_components)]
     return pd.DataFrame(data=projected, columns=columns)
+
+
+def count_missing(df: pd.DataFrame) -> int:
+    """
+    Count the number of missing values in a dataframe.
+
+    Args:
+        df: The dataframe to analyze.
+
+    Returns:
+        int, the number of missing values.
+    """
+    return int(df.isnull().sum().sum())

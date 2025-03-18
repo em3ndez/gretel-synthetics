@@ -26,20 +26,35 @@ Now you will use the ``load()`` class method from an actual tokenizer class to l
 trained model in and now you can use it on input data.
 
 """
+
 import json
 import logging
+import re
 import shutil
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, TYPE_CHECKING
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Pattern,
+    Set,
+    Tuple,
+    TYPE_CHECKING,
+)
 
 import cloudpickle
-import gretel_synthetics.const as const
 import numpy as np
 import sentencepiece as spm
 
 from smart_open import open as smart_open
+
+import gretel_synthetics.const as const
+
+from gretel_synthetics.errors import ParameterError
 
 if TYPE_CHECKING:
     from gretel_synthetics.config import BaseConfig
@@ -51,6 +66,7 @@ logging.basicConfig(
     format="%(asctime)s : %(threadName)s : %(levelname)s : %(message)s",
     level=logging.INFO,
 )
+logger = logging.getLogger(__name__)
 
 spm_logger = logging.getLogger("sentencepiece")
 spm_logger.setLevel(logging.INFO)
@@ -207,27 +223,39 @@ class BaseTokenizer(Base):
 
     field_delimiter: Optional[str] = None
     field_delimiter_token: Optional[str] = None
+    settings: Optional[dict] = None
 
     def __init__(self, model_data: Any, model_dir: str):
         self._model = model_data
         self._model_dir = model_dir
 
         self._load_delimiter_data()
+        self._load_settings_dict()
         super().__init__()
 
     def _load_delimiter_data(self):
         params_file = Path(self._model_dir) / self.settings_fname
 
         if not params_file.is_file():
-            model_params_dict = json.loads(
-                open(Path(self._model_dir) / const.MODEL_PARAMS).read()
-            )
+            with open(Path(self._model_dir) / const.MODEL_PARAMS) as f:
+                model_params_dict = json.load(f)
             self.field_delimiter = model_params_dict[FIELD_DELIM]
             self.field_delimiter_token = model_params_dict[FIELD_DELIM_TOKEN]
         else:
-            params_dict = json.loads(open(params_file).read())
+            with open(params_file) as f:
+                params_dict = json.load(f)
             self.field_delimiter = params_dict.get(FIELD_DELIM, None)
             self.field_delimiter_token = params_dict.get(FIELD_DELIM_TOKEN, None)
+
+    def _load_settings_dict(self):
+        """Load the dictionary of custom settings that were saved out
+        when creating the tokenizer
+        """
+        params_file = Path(self._model_dir) / self.settings_fname
+        if not params_file.is_file():
+            self.settings = {}
+        else:
+            self.settings = json.loads(params_file.read_text())
 
     @classmethod
     @abstractmethod
@@ -380,6 +408,16 @@ class CharTokenizer(BaseTokenizer):
 #################
 
 
+class VocabSizeTooSmall(ParameterError):
+    """
+    Error that is raised when the `vocab_size` is too small for the given data.
+    This happens, when the `vocab_size` is set to a value that is smaller than the
+    number of required characters.
+    """
+
+    ...
+
+
 class SentencePieceTokenizerTrainer(BaseTokenizerTrainer):
     """Train a tokenizer using Google SentencePiece."""
 
@@ -430,6 +468,9 @@ class SentencePieceTokenizerTrainer(BaseTokenizerTrainer):
 
         super().__init__(**kwargs)
 
+    def _no_delim_line(self, line: str) -> str:
+        return line.strip() + self.newline_str + "\n"
+
     def _annotate_training_line(self, line: str):
         if self.config.field_delimiter is not None:
             line = line.strip().replace(
@@ -437,23 +478,39 @@ class SentencePieceTokenizerTrainer(BaseTokenizerTrainer):
             )
             line += f"{self.newline_str}\n"
         else:
-            line = line.strip() + self.newline_str + "\n"
+            line = self._no_delim_line(line)
 
         return line
 
-    def _train(self):
-        logging.info("Training SentencePiece tokenizer")
-        spm.SentencePieceTrainer.Train(
-            input=self.config.training_data_path,
-            model_prefix=const.MODEL_PREFIX,
-            user_defined_symbols=[self.newline_str, self.config.field_delimiter_token],
-            vocab_size=self.vocab_size,
-            hard_vocab_limit=False,
-            max_sentence_length=self.max_line_line,
-            input_sentence_size=self.pretrain_sentence_count,
-            shuffle_input_sentence=True,
-            character_coverage=self.character_coverage,
-        )
+    def _train(self, extra_symbols: Optional[List[str]] = None):
+        if extra_symbols is None:
+            extra_symbols = []
+        user_defined_symbols = [
+            self.newline_str,
+            self.config.field_delimiter_token,
+        ] + extra_symbols
+        logger.info("Training SentencePiece tokenizer")
+        try:
+            spm.SentencePieceTrainer.Train(
+                input=self.config.training_data_path,
+                model_prefix=const.MODEL_PREFIX,
+                user_defined_symbols=user_defined_symbols,
+                vocab_size=self.vocab_size,
+                hard_vocab_limit=False,
+                max_sentence_length=self.max_line_line,
+                input_sentence_size=self.pretrain_sentence_count,
+                shuffle_input_sentence=True,
+                character_coverage=self.character_coverage,
+            )
+        except RuntimeError as e:
+            if "Vocabulary size is smaller than required_chars" in str(e):
+                raise VocabSizeTooSmall(
+                    "The value for the `vocab_size` parameter is too small for the "
+                    "provided dataset. Please increase it or set it to `0` to use "
+                    "character-based tokenization."
+                ) from e
+
+            raise e
 
         # The training automatically saves to disk,
         # so we have to now load it back in after we move
@@ -475,25 +532,85 @@ class SentencePieceTokenizerTrainer(BaseTokenizerTrainer):
         }
 
 
+_DEFAULT_COL_PATTERN = "<col{}>"
+_COL_PATTERN_RE = re.compile(r"^<[a-zA-z]{3,5}\{\}>$")
+COL_PATTERN = "col_pattern"
+
+
+def _add_column_markers(
+    delim: str,
+    col_pattern: str,
+    newline_str: str,
+    line: str,
+    ignore_newline: bool = False,
+) -> Tuple[str, Set[str]]:
+    symbols = set()  # track every column token we create i.e. <colN>
+    line = line.strip()
+    parts = line.split(delim)
+    new_parts = []
+    for idx, value in enumerate(parts):
+        symbol = col_pattern.format(idx)
+        new_parts.append(symbol)
+        new_parts.append(value)
+        symbols.add(symbol)
+    if not ignore_newline:
+        new_parts.extend([newline_str, "\n"])
+    return "".join(new_parts), symbols
+
+
+class SentencePieceColumnTokenizerTrainer(SentencePieceTokenizerTrainer):
+    _col_pattern: str
+    _col_symbols: Set[str]
+
+    def __init__(self, col_pattern: str = _DEFAULT_COL_PATTERN, **kwargs):
+        if not _COL_PATTERN_RE.match(col_pattern):
+            raise ValueError(
+                f"col_pattern must satisfy the following pattern: {_COL_PATTERN_RE.pattern}"
+            )
+        self._col_pattern = col_pattern
+        self._col_symbols = set()
+        super().__init__(**kwargs)
+
+    def _annotate_training_line(self, line: str) -> str:
+        if self.config.field_delimiter is not None:
+            new_line, symbols = _add_column_markers(
+                self.config.field_delimiter, self._col_pattern, self.newline_str, line
+            )
+            self._col_symbols = self._col_symbols.union(symbols)
+            return new_line
+        else:
+            return self._no_delim_line(line)
+
+    def _get_save_settings(self) -> dict:
+        curr_dict = super()._get_save_settings()
+        curr_dict[COL_PATTERN] = self._col_pattern
+        return curr_dict
+
+    def _train(self):
+        super()._train(extra_symbols=sorted(list(self._col_symbols)))
+
+
 def _log_sample_data(model_dir: str, sp: spm.SentencePieceProcessor):
     training_data_path = Path(model_dir) / const.TRAINING_DATA
     if not training_data_path.is_file():
-        logging.info("Training data not found for SP sampling")
+        logger.info("Training data not found for SP sampling")
         return
 
     with open(training_data_path) as fin:
         sample = fin.readline().strip()
 
-    logging.info(f"Tokenizer model vocabulary size: {len(sp)} tokens")
-    logging.info(
+    logger.info(f"Tokenizer model vocabulary size: {len(sp)} tokens")
+    logger.info(
         "Mapping first line of training data\n\n{}\n ---- sample tokens mapped to pieces ---- > \n{}\n".format(
             repr(sample), ", ".join(sp.SampleEncodeAsPieces(sample, -1, 0.1))
-        )
+        ),
+        extra={"sensitive": True},
     )
-    logging.info(
+    logger.info(
         "Mapping first line of training data\n\n{}\n ---- sample tokens mapped to int ---- > \n{}\n".format(
             repr(sample), ", ".join([str(idx) for idx in sp.EncodeAsIds(sample)])
-        )
+        ),
+        extra={"sensitive": True},
     )
 
 
@@ -514,7 +631,7 @@ class SentencePieceTokenizer(BaseTokenizer):
         """
         sp = spm.SentencePieceProcessor()
         model_fname = f"{const.MODEL_PREFIX}.model"
-        logging.info("Loading tokenizer from: %s", model_fname)
+        logger.info("Loading tokenizer from: %s", model_fname)
         model_path = Path(model_dir) / model_fname
         sp.Load(str(model_path))
         _log_sample_data(model_dir, sp)
@@ -545,12 +662,47 @@ class SentencePieceTokenizer(BaseTokenizer):
         return line.replace(self.field_delimiter_token, self.field_delimiter)
 
 
+class SentencePieceColumnTokenizer(SentencePieceTokenizer):
+    _col_pattern: str
+    _col_pattern_re: Pattern
+
+    def __init__(self, sp: spm.SentencePieceProcessor, model_dir: str):
+        super().__init__(sp, model_dir)
+        self._col_pattern = self.settings.get(COL_PATTERN)
+        self._col_pattern_re = re.compile(self._col_pattern.replace("{}", "\\d+"))
+
+    def _restore_delims(self, line_with_tokens: str) -> str:
+        # NOTE: Since with this tokenizer the <colN> values are _before_
+        # the actual values, we skip the first string in the split parts
+        # because it will just be an empty string, so something like
+        # <col0>foo<col1>bar will split into ['', 'foo', 'bar]
+        parts = self._col_pattern_re.split(line_with_tokens)[1:]
+        return self.field_delimiter.join(parts)
+
+    def _replace_decoded_tokens(self, decoded_line: str) -> str:
+        return self._restore_delims(decoded_line)
+
+    def tokenize_delimiter(self, line: str) -> str:
+        new_line, _ = _add_column_markers(
+            self.field_delimiter,
+            self._col_pattern,
+            self.newline_str,  # ignored
+            line,
+            ignore_newline=True,
+        )
+        return new_line
+
+    def detokenize_delimiter(self, line: str) -> str:
+        return self._replace_decoded_tokens(line)
+
+
 ##########
 # Factory
 ##########
 
 TOK_MAP = {
     SentencePieceTokenizerTrainer.__name__: SentencePieceTokenizer,
+    SentencePieceColumnTokenizerTrainer.__name__: SentencePieceColumnTokenizer,
     CharTokenizerTrainer.__name__: CharTokenizer,
 }
 

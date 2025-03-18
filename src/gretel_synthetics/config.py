@@ -4,6 +4,7 @@ confguration parameters for training a model and generating data.
 
 For example usage please see our Jupyter Notebooks.
 """
+
 import json
 import logging
 
@@ -13,10 +14,6 @@ from pathlib import Path
 from typing import Callable, Optional, TYPE_CHECKING
 
 import gretel_synthetics.const as const
-import tensorflow as tf
-
-from gretel_synthetics.tensorflow.generator import TensorFlowGenerator
-from gretel_synthetics.tensorflow.train import train_rnn
 
 logging.basicConfig(
     format="%(asctime)s : %(threadName)s : %(levelname)s : %(message)s",
@@ -224,7 +221,7 @@ class TensorFlowConfig(BaseConfig):
         dp_microbatches (optional): Each batch of data is split into smaller units called micro-batches.
             Computational overhead can be reduced by increasing the size of micro-batches to include
             more than one training example. The number of micro-batches should divide evenly into
-            the overall ``batch_size``. Default is ``64``.
+            the overall ``batch_size``. Default is ``1``.
         gen_temp (optional): Controls the randomness of predictions by scaling the logits before
             applying softmax. Low temperatures result in more predictable text. Higher temperatures
             result in more surprising text. Experiment to find the best setting. Default is ``1.0``.
@@ -263,7 +260,7 @@ class TensorFlowConfig(BaseConfig):
     dp: bool = False
     dp_noise_multiplier: float = 0.1
     dp_l2_norm_clip: float = 3.0
-    dp_microbatches: int = 64
+    dp_microbatches: int = 1
 
     # Generation settings
     gen_temp: float = 1.0
@@ -278,16 +275,6 @@ class TensorFlowConfig(BaseConfig):
 
     def __post_init__(self):
         if self.dp:
-            major, minor, _ = tf.__version__.split(".")
-            if (int(major), int(minor)) < (2, 4):
-                raise RuntimeError(
-                    "Running in differential privacy mode requires TensorFlow 2.4.x or greater. "
-                    "Please see the README for details"
-                )
-            if self.batch_size % self.dp_microbatches != 0:
-                raise ValueError(
-                    "Number of dp_microbatches should divide evenly into batch_size"
-                )
 
             # TODO: To enable micro-batch size greater than 1, we need to update the differential privacy
             #  optimizer loss function to compute the vector of per-example losses, rather than the mean
@@ -295,7 +282,8 @@ class TensorFlowConfig(BaseConfig):
             if self.dp_microbatches != 1:
                 logging.warning(
                     "***** Currently only a differential privacy micro-batch size of 1 is supported. "
-                    "Setting micro-batch size to 1. *****"
+                    "Setting micro-batch size to 1. *****",
+                    extra={"user_log": True},
                 )
                 self.dp_microbatches = 1
 
@@ -320,15 +308,13 @@ class TensorFlowConfig(BaseConfig):
         super().__post_init__()
 
     def get_generator_class(self):
-        return TensorFlowGenerator
+        return None
 
     def get_training_callable(self):
-        return train_rnn
+        return None
 
     def gpu_check(self):
-        device_name = tf.test.gpu_device_name()
-        if not device_name.startswith("/device:GPU:"):
-            logging.warning("***** GPU not found, CPU will be used instead! *****")
+        pass
 
 
 #################
@@ -352,7 +338,8 @@ def config_from_model_dir(model_dir: str) -> BaseConfig:
     package and will instantiate a TensorFlowConfig
     """
     params_file = Path(model_dir) / const.MODEL_PARAMS
-    params_dict = json.loads(open(params_file).read())
+    with open(params_file) as f:
+        params_dict = json.load(f)
     model_type = params_dict.pop(const.MODEL_TYPE, None)
 
     # swap out the checkpoint dir location for the currently

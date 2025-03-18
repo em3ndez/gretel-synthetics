@@ -5,16 +5,19 @@ on: [push]
 jobs:
   tests:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python:
+        # These have to be strings, as, e.g., 3.10 and 3.1 are NOT the same.
+        - "3.9"
     steps:
     - uses: actions/checkout@v1
     - name: Setup Python
       uses: actions/setup-python@v1
       with:
-        python-version: 3.6
-    - name: Install TF
-      run:  pip install tensorflow==2.4
+        python-version: ${{ matrix.python }}
     - name: Install gretel-synthetics
-      run: pip install -e .[all,test]
+      run: pip install -e .[all,test] --use-deprecated=legacy-resolver
     - name: Lint
       run: |
         # stop the build if there are Python syntax errors or undefined names
@@ -23,11 +26,3 @@ jobs:
         flake8 --count --exit-zero --max-complexity=30 --max-line-length=120 --statistics src/
     - name: Test
       run: pytest -s -vv --cov src --cov-report term-missing tests/
-    - uses: 8398a7/action-slack@v2
-      with:
-        status: ${{ job.status }}
-        author_name: Unit Test
-        only_mention_fail: here
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-      if: always()

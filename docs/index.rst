@@ -19,6 +19,8 @@ Modules
    api/generate.rst
    api/batch.rst
    utils/index.rst
+   models/timeseries_dgan.rst
+   models/actgan.rst
 
 
 Indices and tables

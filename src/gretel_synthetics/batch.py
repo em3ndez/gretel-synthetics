@@ -7,6 +7,7 @@ Then we can concat each sub-DF back into one final synthetic dataset.
 
 For example usage, please see our Jupyter Notebook.
 """
+
 import abc
 import csv
 import glob
@@ -29,9 +30,13 @@ from typing import Iterator as IteratorType
 from typing import List, Optional, Tuple, Type, Union
 
 import cloudpickle
-import gretel_synthetics.const as const
 import numpy as np
 import pandas as pd
+
+from pandas.errors import EmptyDataError
+from tqdm.auto import tqdm
+
+import gretel_synthetics.const as const
 
 from gretel_synthetics.config import (
     BaseConfig,
@@ -39,11 +44,10 @@ from gretel_synthetics.config import (
     CONFIG_MAP,
     LocalConfig,
 )
-from gretel_synthetics.errors import TooManyInvalidError
+from gretel_synthetics.errors import InvalidSeedError, TooManyInvalidError
 from gretel_synthetics.generate import generate_text, GenText, SeedingGenerator
 from gretel_synthetics.tokenizers import BaseTokenizerTrainer
 from gretel_synthetics.train import train
-from tqdm.auto import tqdm
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
@@ -134,7 +138,7 @@ class Batch:
         p = Path(self.checkpoint_dir) / "validator.p.gz"
         if p.exists():
             with gzip.open(p, "r") as fin:
-                self.validator = cloudpickle.loads(fin.read())
+                self.validator = cloudpickle.load(fin)
 
     def reset_gen_data(self):
         """Reset all objects that accumulate or track synthetic
@@ -179,7 +183,8 @@ def _create_batch_from_dir(batch_dir: str):
 
     if not (path / HEADER_FILE).is_file():  # pragma: no cover
         raise ValueError("missing headers")
-    headers = json.loads(open(path / HEADER_FILE).read())
+    with open(path / HEADER_FILE) as f:
+        headers = json.load(f)
 
     if not (path / CONFIG_FILE).is_file():  # pragma: no cover
         raise ValueError("missing model param file")
@@ -297,7 +302,7 @@ def _validate_batch_seed_values(
 
     for seed in seed_values:
         if len(seed) > len(batch.headers):
-            raise RuntimeError(
+            raise InvalidSeedError(
                 "The number of seed fields is greater than the number of columns in the first batch"
             )
 
@@ -306,7 +311,7 @@ def _validate_batch_seed_values(
         for header in headers_to_seed:
             value = seed.get(header)
             if value is None:
-                raise RuntimeError(
+                raise InvalidSeedError(
                     f"The header: {header} is not in the seed values mapping"
                 )  # noqa
             tmp.append(str(value))
@@ -327,12 +332,10 @@ class _BufferedRecords(abc.ABC):
     """
 
     @abc.abstractmethod
-    def add(self, record: dict):
-        ...
+    def add(self, record: dict): ...
 
     @abc.abstractmethod
-    def get_records(self):
-        ...
+    def get_records(self): ...
 
     def cleanup(self):
         pass
@@ -392,8 +395,12 @@ class _BufferedDataFrame(_BufferedRecords):
     @property
     def df(self) -> pd.DataFrame:
         self.buffer.seek(0)
-        df = pd.read_csv(self.buffer, sep=self.delim)
-        return df[self.columns]
+        try:
+            df = pd.read_csv(self.buffer, sep=self.delim)
+            return df[self.columns]
+
+        except EmptyDataError:
+            return pd.DataFrame(columns=self.columns)
 
     def get_records(self) -> pd.DataFrame:
         return self.df
@@ -476,7 +483,6 @@ class _GenerationCallback:
         *,
         force_update=False,
     ):
-
         """
         Method that's being called from the generator with a progress update.
 
@@ -495,11 +501,12 @@ class _GenerationCallback:
                 current_valid_count=valid_count,
                 current_invalid_count=invalid_count,
                 new_valid_count=valid_count - self._last_progress.current_valid_count,
-                new_invalid_count=invalid_count
-                - self._last_progress.current_invalid_count,
-                completion_percent=0
-                if num_lines == 0
-                else round(valid_count / num_lines * 100, 2),
+                new_invalid_count=(
+                    invalid_count - self._last_progress.current_invalid_count
+                ),
+                completion_percent=(
+                    0 if num_lines == 0 else round(valid_count / num_lines * 100, 2)
+                ),
             )
 
             self._callback_fn(current_progress)
@@ -540,6 +547,14 @@ def _threading_generation_callback(
             event.set()
             break
         time.sleep(1)
+
+
+@dataclass
+class GenerationResult:
+    # Type depends on type of _BufferedRecords that was used.
+    records: Union[pd.DataFrame, List[dict]]
+    # If generation was stopped because of exception, it will be stored here.
+    exception: Optional[Exception] = None
 
 
 class RecordFactory:
@@ -821,7 +836,7 @@ class RecordFactory:
         callback: Optional[callable] = None,
         callback_interval: int = 30,
         callback_threading: bool = False,
-    ):
+    ) -> GenerationResult:
         """Attempt to generate the full number of records that was set when
         creating the ``RecordFactory.``  This method will create a buffer
         that holds all records and then returns the the buffer once
@@ -850,6 +865,8 @@ class RecordFactory:
         progress_callback = None
         if callback:
             progress_callback = _GenerationCallback(callback, callback_interval)
+            # reset the underlying callback, since we are starting a new genaration
+            callback(GenerationProgress(), reset=True)
 
         self.reset()
         if output is not None and output not in ("df",):
@@ -881,7 +898,7 @@ class RecordFactory:
         try:
             for rec in _iter:
                 # NOTE: This iterator will block while no records are being
-                # succesfully generated. If callbacks need to occur in this
+                # successfully generated. If callbacks need to occur in this
                 # situation, ensure the callback threading option is enabled
                 #
                 # If threading is enabled, and the callback encounters an exception,
@@ -905,18 +922,22 @@ class RecordFactory:
                 self._thread_event.set()
                 callback_thread.join()
 
-        # send final progress update
-        if progress_callback:
-            progress_callback.update_progress(
-                self._counter.num_lines,
-                self._counter.valid_count,
-                self._counter.invalid_count,
-                force_update=True,
-            )
-
         out_records = buffer.get_records()
         buffer.cleanup()
-        return out_records
+
+        try:
+            # send final progress update
+            if progress_callback:
+                progress_callback.update_progress(
+                    self._counter.num_lines,
+                    self._counter.valid_count,
+                    self._counter.invalid_count,
+                    force_update=True,
+                )
+            return GenerationResult(records=out_records)
+
+        except Exception as e:
+            return GenerationResult(records=out_records, exception=e)
 
     @property
     def summary(self):
@@ -1006,6 +1027,7 @@ class DataFrameBatch:
         tokenizer: BaseTokenizerTrainer = None,
         mode: str = WRITE,
         checkpoint_dir: str = None,
+        validate_model: bool = True,
     ):
 
         if mode not in (WRITE, READ):  # pragma: no cover
@@ -1094,13 +1116,14 @@ class DataFrameBatch:
             except FileNotFoundError:
                 self.original_headers = None
 
-            logger.info("Validating underlying models exist via generation test...")
-            try:
-                self.generate_all_batch_lines(parallelism=1, num_lines=1)
-            except Exception as err:
-                raise RuntimeError(
-                    "Error testing generation during model load"
-                ) from err
+            if validate_model:
+                logger.info("Validating underlying models exist via generation test...")
+                try:
+                    self.generate_all_batch_lines(parallelism=1, num_lines=1)
+                except Exception as err:
+                    raise RuntimeError(
+                        "Error testing generation during model load"
+                    ) from err
 
     def _create_header_batches(self):
         num_batches = ceil(len(self._source_df.columns) / self.batch_size)

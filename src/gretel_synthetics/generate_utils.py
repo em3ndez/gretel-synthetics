@@ -1,6 +1,7 @@
 """
 Misc utils for generating data
 """
+
 import glob
 import gzip
 import logging
@@ -10,10 +11,12 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Callable, Optional, Union
 
+from smart_open import open as smart_open
+
 from gretel_synthetics.batch import DataFrameBatch, MAX_INVALID
 from gretel_synthetics.config import config_from_model_dir
 from gretel_synthetics.generate import generate_text
-from smart_open import open as smart_open
+from gretel_synthetics.utils.tar_util import safe_extractall
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
@@ -82,11 +85,13 @@ class DataFileGenerator:
 
         if self.model_path.suffixes == [".tar", ".gz"]:
             with TemporaryDirectory() as tmpdir:
-                with smart_open(str(self.raw_model_path), "rb", ignore_ext=True) as fin:
+                with smart_open(
+                    str(self.raw_model_path), "rb", compression="disable"
+                ) as fin:
                     with gzip.open(fin) as gzip_in:
                         with tarfile.open(fileobj=gzip_in, mode="r:gz") as tar_in:
                             logging.info("Extracting archive to temp dir...")
-                            tar_in.extractall(tmpdir)
+                            safe_extractall(tar_in, tmpdir)
 
                 return self._generate(
                     Path(tmpdir), count, file_name, seed, validator, parallelism

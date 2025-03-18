@@ -20,6 +20,7 @@ TOK:
     - char
     - sp
 """
+
 import gzip
 import random
 import tarfile
@@ -30,9 +31,11 @@ from unittest.mock import Mock
 import pandas as pd
 import pytest
 
+from smart_open import open as smart_open
+
 from gretel_synthetics.batch import DataFrameBatch, GenerationProgress
 from gretel_synthetics.generate_utils import DataFileGenerator
-from smart_open import open as smart_open
+from gretel_synthetics.utils.tar_util import safe_extractall
 
 BATCH_MODELS = [
     "https://gretel-public-website.s3-us-west-2.amazonaws.com/tests/synthetics/models/safecast-batch-sp-0-14.tar.gz",
@@ -40,16 +43,16 @@ BATCH_MODELS = [
 
 
 def _unpack_to_dir(source: str, target: str):
-    with smart_open(source, "rb", ignore_ext=True) as fin:
+    with smart_open(source, "rb", compression="disable") as fin:
         with gzip.open(fin) as gzip_in:
             with tarfile.open(fileobj=gzip_in, mode="r:gz") as tar_in:
-                tar_in.extractall(target)
+                safe_extractall(tar_in, target)
 
 
 def _unpack_to_dir_nogz(source: str, target: str):
-    with smart_open(source, "rb", ignore_ext=True) as fin:
+    with smart_open(source, "rb", compression="disable") as fin:
         with tarfile.open(fileobj=fin, mode="r:gz") as tar_in:
-            tar_in.extractall(target)
+            safe_extractall(tar_in, target)
 
 
 @pytest.fixture(scope="module")
@@ -98,9 +101,9 @@ def test_record_factory_generate_all(safecast_model_dir):
     next(factory)
 
     # generate_all should reset our iterator for the full 10 records
-    assert len(factory.generate_all()) == 10
+    assert len(factory.generate_all().records) == 10
 
-    df = factory.generate_all(output="df")
+    df = factory.generate_all(output="df").records
     assert df.shape == (10, 16)
     assert str(df["payload.loc_lat"].dtype) == "float64"
 
@@ -123,7 +126,7 @@ def test_record_factory_generate_all_with_callback(safecast_model_dir, threading
         callback=callback_fn,
         callback_interval=1,
         callback_threading=threading,
-    )
+    ).records
     assert df.shape == (1000, 16)
 
     # assuming we get at least 5 bad records
@@ -225,11 +228,11 @@ def scooter_val(line):
 
 SIMPLE_MODELS = [
     (
-        "https://gretel-public-website.s3-us-west-2.amazonaws.com/tests/synthetics/models/scooter-simple-sp-0-14.tar.gz",
+        "https://gretel-public-website.s3-us-west-2.amazonaws.com/tests/synthetics/models/scooter-simple-sp-0-14.tar.gz",  # noqa
         scooter_val,
     ),  # noqa
     (
-        "https://gretel-public-website.s3-us-west-2.amazonaws.com/tests/synthetics/models/scooter-simple-char-0-15.tar.gz",
+        "https://gretel-public-website.s3-us-west-2.amazonaws.com/tests/synthetics/models/scooter-simple-char-0-15.tar.gz",  # noqa
         scooter_val,
     ),  # noqa
 ]
@@ -251,7 +254,7 @@ def test_generate_simple(model_path, validator_fn, tmp_path):
     "model_path,seed",
     [
         (
-            "https://gretel-public-website.s3-us-west-2.amazonaws.com/tests/synthetics/models/safecast-batch-sp-0-14.tar.gz",
+            "https://gretel-public-website.s3-us-west-2.amazonaws.com/tests/synthetics/models/safecast-batch-sp-0-14.tar.gz",  # noqa
             {"payload.service_handler": "i-051a2a353509414f0"},
         )  # noqa
     ],
@@ -337,7 +340,7 @@ def test_record_factory_smart_seed_buffer(safecast_model_dir):
         max_invalid=5000,
     )
 
-    df = factory.generate_all(output="df")
+    df = factory.generate_all(output="df").records
     assert len(df) == 8
     assert factory.summary["num_lines"] == 8
     assert factory.summary["valid_count"] == 8
@@ -348,7 +351,7 @@ def test_record_factory_multi_batch(hr_model_dir):
 
     factory = batcher.create_record_factory(num_lines=50, max_invalid=5000)
 
-    df = factory.generate_all(output="df")
+    df = factory.generate_all(output="df").records
     assert len(df) == 50
 
 
@@ -364,7 +367,7 @@ def test_record_factory_multi_batch_seed_list(hr_model_dir):
         validator=MyValidator(),
     )
 
-    df = factory.generate_all(output="df")
+    df = factory.generate_all(output="df").records
     assert len(df) == 50
     assert df["age"].nunique() == 50
 
@@ -376,7 +379,7 @@ def test_record_factory_multi_batch_seed_static(hr_model_dir):
         num_lines=10, max_invalid=5000, seed_fields={"age": 5}, validator=MyValidator()
     )
 
-    df = factory.generate_all(output="df")
+    df = factory.generate_all(output="df").records
     assert len(df) == 10
     assert df["age"].nunique() == 1
     assert df.iloc[0]["age"] == 5

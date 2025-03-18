@@ -1,10 +1,11 @@
 from copy import deepcopy
+from unittest.mock import Mock, patch
 
 from gretel_synthetics.tokenizers import (
     CharTokenizerTrainer,
     SentencePieceTokenizerTrainer,
 )
-from gretel_synthetics.train import _create_default_tokenizer
+from gretel_synthetics.train import _create_default_tokenizer, train
 
 
 def test_default_tokenizer(tf_config):
